@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""tv-defreeze — cut the dead air out of a recorded run, and keep the beats honest.
+
+Gaps between your Bash tool calls freeze onto camera. A long QA pass easily
+carries several 10-20 s frozen frames. This trims every frozen stretch down to
+a short hold, then rewrites `segs.txt` and `beats.tsv` so the run stays usable.
+
+Two things it does that a hand-rolled freezedetect pass gets wrong:
+
+1. **Title cards are left alone.** They are static by design. A blanket trim
+    cuts a 4 s section card to 1.6 s and nobody can read it. Card segments are
+    identified from `beats.tsv` (`card section` / `card subsection` labels).
+
+2. **Beats are re-mapped, not left to rot.** `beat` offsets are logged against
+    the raw footage. Trimming removes exactly the frozen spans the beats sit
+    next to, so afterwards every offset is seconds off — and if you feed those
+    to `tv-narrate-video` the narration lands early or late on almost every
+    line. This rebuilds each beat's offset by pushing it through the same
+    kept-interval map the trim used, so `at` values stay truthful.
+
+Usage:
+    tv-defreeze --run ~/qaRun/<stamp>__<desc> [--cap 1.6] [--min 2.5]
+
+Writes `segNNN_trim.mp4` beside each `segNNN_norm.mp4`, points `segs.txt` at
+the right file per segment, and rewrites `beats.tsv` in place (the original is
+kept as `beats_raw.tsv`). Re-run `render_video`'s concat afterwards.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+
+def probe(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                        "format=duration", "-of", "csv=p=0", path],
+                       capture_output=True, text=True)
+    return float(r.stdout.strip())
+
+
+def freeze_spans(path, dur, minlen):
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-i", path, "-vf",
+                        f"freezedetect=n=-60dB:d={minlen}", "-an", "-f",
+                        "null", "-"], capture_output=True, text=True).stderr
+    starts = [float(x) for x in re.findall(r"freeze_start: ([\d.]+)", p)]
+    ends = [float(x) for x in re.findall(r"freeze_end: ([\d.]+)", p)]
+    durs = [float(x) for x in re.findall(r"freeze_duration: ([\d.]+)", p)]
+    out = []
+    for i, s in enumerate(starts):
+        e = ends[i] if i < len(ends) else (s + durs[i] if i < len(durs) else dur)
+        out.append((max(0.0, s), min(dur, e)))
+    return [(a, b) for a, b in out if b - a > minlen]
+
+
+def kept_intervals(spans, dur, cap):
+    keep, cur = [], 0.0
+    for a, b in spans:
+        keep.append((cur, min(a + cap, b)))
+        cur = b
+    if cur < dur - 0.05:
+        keep.append((cur, dur))
+    return [(a, b) for a, b in keep if b - a > 0.05]
+
+
+def remap(t, keep):
+    """original offset -> offset in the trimmed file"""
+    out = 0.0
+    for a, b in keep:
+        if t < a:
+            return round(out, 2)          # fell inside a removed chunk
+        if t <= b:
+            return round(out + (t - a), 2)
+        out += b - a
+    return round(max(out - 0.3, 0.0), 2)  # past the end: clamp to the last frame
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--cap", type=float, default=1.6,
+                    help="longest hold to keep from any frozen stretch")
+    ap.add_argument("--min", type=float, default=2.5,
+                    help="only trim frozen stretches longer than this")
+    a = ap.parse_args()
+    run = a.run.rstrip("/")
+
+    segs = [l.strip()[6:-1] for l in open(os.path.join(run, "segs.txt")) if l.strip()]
+    beats_path = os.path.join(run, "beats.tsv")
+    raw_path = os.path.join(run, "beats_raw.tsv")
+    if os.path.exists(beats_path) and not os.path.exists(raw_path):
+        os.rename(beats_path, raw_path)
+
+    cards, beats = set(), {}
+    if os.path.exists(raw_path):
+        for line in open(raw_path):
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 3:
+                continue
+            seg, ms, label = int(p[0]), int(p[1]), p[2]
+            if label.startswith("card "):
+                cards.add(seg)
+            beats.setdefault(seg, []).append((ms / 1000.0, label))
+
+    out_files, out_beats = [], []
+    for i, src in enumerate(segs, 1):
+        norm = src if src.endswith("_norm.mp4") else src.rsplit(".", 1)[0] + "_norm.mp4"
+        if not os.path.exists(norm):
+            print(f"seg{i:03d}: no normalised file, leaving as is", file=sys.stderr)
+            out_files.append(src)
+            for t, lab in beats.get(i, []):
+                out_beats.append((i, t, lab))
+            continue
+
+        dur = probe(norm)
+        if i in cards:
+            out_files.append(norm)
+            for t, lab in beats.get(i, []):
+                out_beats.append((i, t, lab))
+            continue
+
+        spans = freeze_spans(norm, dur, a.min)
+        if not spans:
+            out_files.append(norm)
+            for t, lab in beats.get(i, []):
+                out_beats.append((i, t, lab))
+            continue
+
+        keep = kept_intervals(spans, dur, a.cap)
+        expr = "+".join(f"between(t,{x:.3f},{y:.3f})" for x, y in keep)
+        trim = norm.replace("_norm.mp4", "_trim.mp4")
+        r = subprocess.run(["ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+                            "-i", norm, "-vf",
+                            f"select='{expr}',setpts=N/FRAME_RATE/TB",
+                            "-c:v", "libx264", "-r", "30", "-an", trim],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"seg{i:03d}: trim failed, keeping full length", file=sys.stderr)
+            out_files.append(norm)
+            for t, lab in beats.get(i, []):
+                out_beats.append((i, t, lab))
+            continue
+
+        nd = probe(trim)
+        print(f"seg{i:03d}: {dur:6.2f}s -> {nd:6.2f}s  ({len(spans)} frozen spans)")
+        out_files.append(trim)
+        for t, lab in beats.get(i, []):
+            out_beats.append((i, min(remap(t, keep), max(nd - 0.3, 0.0)), lab))
+
+    with open(os.path.join(run, "segs.txt"), "w") as f:
+        f.write("\n".join(f"file '{p}'" for p in out_files) + "\n")
+    with open(beats_path, "w") as f:
+        for seg, t, lab in out_beats:
+            f.write(f"{seg}\t{int(t * 1000)}\t{lab}\n")
+
+    total = sum(probe(p) for p in out_files)
+    print(f"\n{len(out_files)} segments, {total:.1f}s total")
+    print("segs.txt and beats.tsv rewritten (originals: beats_raw.tsv)")
+    print("beat offsets now refer to the TRIMMED footage — safe to use as "
+          "narration `at` values")
+
+
+if __name__ == "__main__":
+    main()

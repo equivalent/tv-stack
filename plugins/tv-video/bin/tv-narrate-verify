@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""tv-narrate-verify — ask Codex (gpt-5.6-sol) whether the narration matches the picture.
+
+Feeds Codex one frame per spoken sentence, sampled at the instant that sentence
+is heard, together with the sentence itself, and asks for a per-frame verdict.
+Frames are sent in batches so no single request carries too many images.
+"""
+import argparse, json, os, subprocess, sys, textwrap
+
+SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["verdicts", "overall", "understandable_without_qa_doc"],
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["frame", "verdict", "on_screen", "problem", "fix"],
+                "properties": {
+                    "frame": {"type": "string", "description": "frame file name as given"},
+                    "verdict": {"type": "string",
+                                "enum": ["MATCH", "EARLY", "LATE", "MISMATCH", "UNCLEAR"]},
+                    "on_screen": {"type": "string",
+                                  "description": "what is actually visible in this frame"},
+                    "problem": {"type": "string",
+                                "description": "empty string if verdict is MATCH"},
+                    "fix": {"type": "string",
+                            "description": "concrete fix: shift the line N seconds earlier/later, "
+                                           "hold the frame N seconds longer, or reword it to X. "
+                                           "Empty string if verdict is MATCH."},
+                },
+            },
+        },
+        "overall": {"type": "string", "description": "2-4 sentences on how well the narration tracks the picture"},
+        "understandable_without_qa_doc": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["answer", "gaps"],
+            "properties": {
+                "answer": {"type": "string", "enum": ["yes", "partly", "no"]},
+                "gaps": {"type": "string",
+                         "description": "what a viewer with no QA document would still not understand"},
+            },
+        },
+    },
+}
+
+PROMPT = """You are reviewing the narration track of a QA screen-recording.
+
+The video shows a tester driving a web application through numbered QA scenarios.
+A synthetic voice narrates it. Your job is to judge whether WHAT IS SAID matches
+WHAT IS ON SCREEN at the moment it is said, and whether a viewer who has never
+read the QA document would understand what is being tested.
+
+You are given {n} frames. Each frame was captured at the exact midpoint of one
+spoken sentence, so the frame is what the viewer is looking at while hearing
+that sentence. The frames are attached in the same order as this list:
+
+{listing}
+
+Video length: {duration} seconds.{extra}
+
+For EVERY frame return a verdict:
+  MATCH    - the sentence describes what is visible (or is a fair general
+             statement about this moment).
+  EARLY    - the sentence talks about something that has NOT happened yet on
+             screen. Say how many seconds later it should land.
+  LATE     - the sentence talks about something that has ALREADY passed.
+             Say how many seconds earlier it should land.
+  MISMATCH - the sentence describes something that is simply not what is shown.
+  UNCLEAR  - the frame is too ambiguous to judge (say why).
+
+Be strict about EARLY/LATE: narration that names a result while the screen still
+shows the form, or that describes a form while the screen already shows the
+result, is a defect - the whole point is that the audio tracks the picture.
+Do NOT flag a title card whose narration introduces what is about to be tested;
+that is correct by design.
+
+In "fix", give one concrete, actionable instruction: shift this line N seconds
+earlier or later, hold this frame N seconds longer so the line finishes before
+the screen changes, or reword it to something specific.
+
+Finally judge "understandable_without_qa_doc": could a colleague who has never
+seen the QA document watch this and know what feature is under test, what each
+scenario checks, and whether it passed? List what is still missing.
+
+Answer with JSON matching the provided schema and nothing else.
+Do not read or modify any files; everything you need is in this prompt and the
+attached images."""
+
+
+def batches(items, n):
+    for i in range(0, len(items), n):
+        yield i, items[i:i + n]
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="tv-narrate-verify")
+    ap.add_argument("--frames", required=True, help="frames.json from `tv-narrate frames`")
+    ap.add_argument("--batch", type=int, default=10, help="frames per codex call")
+    ap.add_argument("--model", default="gpt-5.6-sol")
+    ap.add_argument("--effort", default="medium")
+    ap.add_argument("--context", default="", help="extra context, e.g. the feature under test")
+    ap.add_argument("--out", help="where to write the merged verdict JSON")
+    a = ap.parse_args()
+
+    with open(a.frames) as f:
+        doc = json.load(f)
+    frames = doc["frames"]
+    outdir = os.path.dirname(os.path.abspath(a.frames))
+    schema_path = os.path.join(outdir, "schema.json")
+    with open(schema_path, "w") as f:
+        json.dump(SCHEMA, f)
+
+    merged = {"verdicts": [], "overall": [], "understandable_without_qa_doc": []}
+    for bi, (start, chunk) in enumerate(batches(frames, a.batch), start=1):
+        listing = "\n".join(
+            f"  {i+1}. {os.path.basename(fr['frame'])}  at {fr['t']}s  "
+            f"spoken: \"{fr['spoken']}\"" for i, fr in enumerate(chunk))
+        extra = f"\n\nContext for this run: {a.context}" if a.context else ""
+        prompt = PROMPT.format(n=len(chunk), listing=listing,
+                               duration=doc["duration"], extra=extra)
+        last = os.path.join(outdir, f"codex_batch{bi}.json")
+        cmd = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+               "-m", a.model, "-c", f'model_reasoning_effort="{a.effort}"',
+               "--output-schema", schema_path, "-o", last]
+        for fr in chunk:
+            cmd += ["-i", fr["frame"]]
+        # The prompt goes over stdin, NOT as a trailing argument: `-i/--image` is
+        # variadic and swallows any positional that follows it.
+        print(f"tv-narrate-verify: batch {bi} ({len(chunk)} frames) -> codex {a.model}/{a.effort}",
+              file=sys.stderr)
+        p = subprocess.run(cmd, input=prompt, capture_output=True, text=True)
+        if p.returncode != 0 or not os.path.exists(last):
+            print(p.stdout[-2000:], file=sys.stderr)
+            print(p.stderr[-2000:], file=sys.stderr)
+            sys.exit(f"codex failed on batch {bi}")
+        with open(last) as f:
+            raw = f.read().strip()
+        try:
+            res = json.loads(raw)
+        except json.JSONDecodeError:
+            s, e = raw.find("{"), raw.rfind("}")
+            res = json.loads(raw[s:e + 1])
+        merged["verdicts"] += res.get("verdicts", [])
+        merged["overall"].append(res.get("overall", ""))
+        merged["understandable_without_qa_doc"].append(
+            res.get("understandable_without_qa_doc", {}))
+
+    out = a.out or os.path.join(outdir, "verdict.json")
+    with open(out, "w") as f:
+        json.dump(merged, f, indent=2)
+
+    by_t = {os.path.basename(fr["frame"]): fr for fr in frames}
+    bad = 0
+    for v in merged["verdicts"]:
+        fr = by_t.get(os.path.basename(v.get("frame", "")), {})
+        mark = "ok " if v["verdict"] == "MATCH" else "!! "
+        if v["verdict"] != "MATCH":
+            bad += 1
+        print(f"{mark}{fr.get('t', '?'):>7}s  {v['verdict']:<9} {v.get('frame')}")
+        if v["verdict"] != "MATCH":
+            print(f"       screen: {v.get('on_screen','')}")
+            print(f"       problem: {v.get('problem','')}")
+            print(f"       fix:     {v.get('fix','')}")
+    print(f"\n{len(merged['verdicts']) - bad}/{len(merged['verdicts'])} frames MATCH")
+    for o in merged["overall"]:
+        print(f"\noverall: {o}")
+    for u in merged["understandable_without_qa_doc"]:
+        print(f"without the QA doc: {u.get('answer')} - {u.get('gaps')}")
+    print(f"\nverdict json: {out}")
+
+
+if __name__ == "__main__":
+    main()

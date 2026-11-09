@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Find, read or post the QA doc comment on a pull request.
+#
+#   tv-qa-doc-comment find <pr>          # prints the comment URL, exit 1 when there is none
+#   tv-qa-doc-comment get  <pr> [out.md] # writes the QA doc held in the comment (stdout by default)
+#   tv-qa-doc-comment post <pr> <doc.md> [--new]
+#   tv-qa-doc-comment video <pr> <video.mp4> <section.md>
+#
+# The comment is the doc's "## In short" section, visible, then the whole doc folded
+# in <details>. It starts with the marker <!-- tv-qa-doc -->, so a later run finds it
+# and edits it instead of adding a second one. --new posts a second comment anyway
+# (only when the user asks for that).
+#
+# video puts the QA run video at the end of the QA comment, after the folded doc, between
+# <!-- tv-qa-video:start --> and <!-- tv-qa-video:end -->. section.md is the text above the
+# player (what was tested, the tally, the run report link). A re-run replaces the block.
+# No QA comment: it posts a video-only comment (it does not start with <!-- tv-qa-doc -->,
+# so get never reads it as a doc) and edits that one on the next run. It prints the URL
+# of the comment that holds the video. post keeps the video block when it edits a comment.
+#
+# gh can attach a file only to a new comment (or to the last one, which may be another
+# comment), so video uploads through a temporary comment, copies the asset URL, edits
+# the QA comment, and deletes the temporary comment. The asset stays: GitHub keeps
+# attachments when their comment is deleted. The script checks that the URL still opens.
+#
+# A comment without the marker still counts when it is the signed-in gh user's own and starts with
+# "## QA doc" (the shape used before the marker existed); post adds the marker to it.
+#
+# Run it inside the repo, or set GH_REPO=owner/repo.
+set -euo pipefail
+
+cmd="${1:?find|get|post}"; pr="${2:?pr number}"
+repo="${GH_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
+me="$(gh api user --jq .login)"
+
+# id<TAB>url of the QA comment, empty when there is none. Marked comments win over old ones.
+find_comment() {
+  gh api "repos/$repo/issues/$pr/comments" --paginate \
+    --jq ".[] | select(.user.login == \"$me\") | [.id, .html_url, (.body | split(\"\n\")[0])] | @tsv" |
+    awk -F'\t' '$3 ~ /^<!-- tv-qa-doc -->/ { print $1 "\t" $2; found=1; exit }
+                $3 ~ /^## QA doc/ && !old { old=$1 "\t" $2 }
+                END { if (!found && old) print old }'
+}
+
+# id<TAB>url of my comment that holds a QA video block, empty when there is none.
+find_video_comment() {
+  gh api "repos/$repo/issues/$pr/comments" --paginate \
+    --jq ".[] | select(.user.login == \"$me\") | select(.body | contains(\"<!-- tv-qa-video:start -->\")) | [.id, .html_url] | @tsv" |
+    head -n 1
+}
+
+# The video block of a comment (from start marker to end marker), empty when there is none.
+video_block() {
+  gh api "repos/$repo/issues/comments/$1" --jq .body |
+    python3 -c '
+import re, sys
+m = re.search(r"<!-- tv-qa-video:start -->.*?<!-- tv-qa-video:end -->", sys.stdin.read().replace("\r\n", "\n"), re.S)
+sys.stdout.write(m.group(0) if m else "")'
+}
+
+# Writes {"body": <file contents>} as JSON to $2.
+json_body() {
+  python3 -c 'import json,sys; json.dump({"body": open(sys.argv[1]).read()}, open(sys.argv[2], "w"))' "$1" "$2"
+}
+
+case "$cmd" in
+  find)
+    hit="$(find_comment)"; [ -n "$hit" ] || exit 1
+    cut -f2 <<<"$hit"
+    ;;
+
+  get)
+    hit="$(find_comment)"; [ -n "$hit" ] || { echo "no QA doc comment on PR #$pr" >&2; exit 1; }
+    gh api "repos/$repo/issues/comments/$(cut -f1 <<<"$hit")" --jq .body |
+      python3 -c '
+import re, sys
+body = sys.stdin.read().replace("\r\n", "\n")
+m = re.search(r"</summary>\n\n(.*)\n</details>", body, re.S)
+if not m:
+    sys.exit("the QA comment has no <details> block")
+sys.stdout.write(m.group(1).strip() + "\n")' > "${3:-/dev/stdout}"
+    ;;
+
+  post)
+    doc="${3:?doc.md}"; new="${4:-}"
+    if grep -niE 'password[^s]*[:=]' "$doc"; then
+      echo "the doc looks like it holds a password; fix it before posting" >&2; exit 1
+    fi
+    body="$(mktemp)"
+    python3 - "$doc" "$body" <<'PY'
+import re, sys
+doc = open(sys.argv[1]).read().strip()
+title = re.search(r"^# (.+)$", doc, re.M)
+title = re.sub(r"^QA test plan:\s*", "", title.group(1)) if title else "QA test plan"
+short = re.search(r"^## In short\n(.*?)(?=^#{1,2} )", doc, re.S | re.M)
+if not short:
+    sys.exit("the doc has no '## In short' section")
+open(sys.argv[2], "w").write(
+    "<!-- tv-qa-doc -->\n## QA doc\n\n" + short.group(1).strip() + "\n\n"
+    f"<details>\n<summary>Full QA doc: {title}</summary>\n\n{doc}\n\n</details>\n")
+PY
+    hit=""; [ "$new" = "--new" ] || hit="$(find_comment)"
+    if [ -n "$hit" ]; then
+      keep="$(video_block "$(cut -f1 <<<"$hit")")"
+      [ -z "$keep" ] || printf '\n%s\n' "$keep" >> "$body"
+    fi
+    size=$(wc -c < "$body")
+    if [ "$size" -gt 65000 ]; then
+      echo "comment would be $size characters; GitHub takes about 65,000. Make the doc shorter and post again." >&2
+      rm -f "$body"; exit 1
+    fi
+    payload="$(mktemp)"
+    json_body "$body" "$payload"
+    if [ -n "$hit" ]; then
+      gh api -X PATCH "repos/$repo/issues/comments/$(cut -f1 <<<"$hit")" --input "$payload" --jq .html_url
+      echo "updated the existing QA comment" >&2
+    else
+      gh api -X POST "repos/$repo/issues/$pr/comments" --input "$payload" --jq .html_url
+      echo "posted a new QA comment" >&2
+    fi
+    rm -f "$body" "$payload"
+    ;;
+
+  video)
+    video="${3:?video.mp4}"; section="${4:?section.md}"
+    [ -f "$video" ] || { echo "no such video: $video" >&2; exit 1; }
+    video="$(cd "$(dirname "$video")" && pwd)/$(basename "$video")"
+    name="$(basename "$video")"; dir="$(dirname "$video")"
+
+    # 1. Upload through a temporary comment, found again by its own marker.
+    tag="tv-qa-upload-$(date +%s)-$$"
+    tmp_body="$dir/.$tag.md"
+    printf '<!-- %s -->\nUploading the QA video. This comment is removed in a moment.\n\n![QA video](./%s)\n' "$tag" "$name" > "$tmp_body"
+    size_mb=$(( $(stat -c %s "$video" 2>/dev/null || stat -f %z "$video") / 1048576 ))
+    echo "uploading $name (${size_mb} MB) to PR #$pr" >&2
+    ( cd "$dir" && gh pr comment "$pr" -R "$repo" --body-file "$(basename "$tmp_body")" --attach "./$name" ) >/dev/null
+    rm -f "$tmp_body"
+    tmp="$(gh api "repos/$repo/issues/$pr/comments" --paginate \
+      --jq ".[] | select(.user.login == \"$me\") | select(.body | contains(\"<!-- $tag -->\")) | [.id, .body] | @json" | head -n 1)"
+    [ -n "$tmp" ] || { echo "FAILED: the upload comment did not appear" >&2; exit 1; }
+    tmp_id="$(jq -r '.[0]' <<<"$tmp")"
+    asset="$(jq -r '.[1]' <<<"$tmp" | grep -oE 'https://github\.com/user-attachments/assets/[A-Za-z0-9-]+' | head -n 1 || true)"
+    if [ -z "$asset" ]; then
+      gh api -X DELETE "repos/$repo/issues/comments/$tmp_id" >/dev/null
+      echo "FAILED: gh did not upload the video (too big? GitHub takes 10 MB on free plans, 100 MB on paid)" >&2
+      exit 1
+    fi
+
+    # 2. Build the video block and put it into the QA comment, or a video-only comment.
+    block="$(mktemp)"
+    { echo '<!-- tv-qa-video:start -->'; echo '## QA video'; echo
+      cat "$section"; echo; echo "$asset"
+      echo '<!-- tv-qa-video:end -->'; } > "$block"
+    hit="$(find_comment)"; [ -n "$hit" ] || hit="$(find_video_comment)"
+    body="$(mktemp)"; payload="$(mktemp)"
+    if [ -n "$hit" ]; then
+      gh api "repos/$repo/issues/comments/$(cut -f1 <<<"$hit")" --jq .body |
+        python3 -c '
+import re, sys
+old = sys.stdin.read().replace("\r\n", "\n")
+old = re.sub(r"\n*<!-- tv-qa-video:start -->.*?<!-- tv-qa-video:end -->\n*", "\n", old, flags=re.S).rstrip()
+sys.stdout.write(old + "\n\n" + open(sys.argv[1]).read())' "$block" > "$body"
+      json_body "$body" "$payload"
+      url="$(gh api -X PATCH "repos/$repo/issues/comments/$(cut -f1 <<<"$hit")" --input "$payload" --jq .html_url)"
+      echo "put the video into the existing comment" >&2
+    else
+      cp "$block" "$body"
+      json_body "$body" "$payload"
+      url="$(gh api -X POST "repos/$repo/issues/$pr/comments" --input "$payload" --jq .html_url)"
+      echo "posted a new comment with the video (the PR has no QA doc comment)" >&2
+    fi
+    rm -f "$block" "$body" "$payload"
+
+    # 3. Remove the temporary comment, then check the asset still opens.
+    gh api -X DELETE "repos/$repo/issues/comments/$tmp_id" >/dev/null
+    code="$(curl -s -o /dev/null -w '%{http_code}' -I -H "Authorization: token $(gh auth token)" "$asset" || true)"
+    case "$code" in
+      200|302) ;;
+      *) echo "WARNING: the video URL answers HTTP $code after the upload comment was removed: $asset" >&2 ;;
+    esac
+    echo "$url"
+    ;;
+
+  *) echo "usage: tv-qa-doc-comment find|get|post|video <pr> ..." >&2; exit 2 ;;
+esac

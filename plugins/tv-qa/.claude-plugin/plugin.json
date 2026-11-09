@@ -1,0 +1,7 @@
+{
+  "name": "tv-qa",
+  "version": "0.1.0",
+  "description": "Write Gherkin QA docs for a pull request, run them in the browser on a narrated video, and write a QA run report. Project details come from a project's tv-qa-notes skill.",
+  "author": { "name": "Tomas Valent" },
+  "dependencies": ["tv-video"]
+}

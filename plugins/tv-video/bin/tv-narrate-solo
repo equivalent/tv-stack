@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""tv-narrate-solo — guarantee that only one voice is ever speaking.
+
+`tv-narrate build` places each cue at the offset you gave it and MIXES whatever
+overlaps. It does not push a cue later to make room. So any two cues whose
+speech collides end up as two voices talking over each other in the finished
+mp4 — the single worst defect a narrated QA video can have, and one you will
+not notice by reading narration.json.
+
+Usage:
+    tv-narrate-solo --run <run_dir>            # report overlaps, exit 1 if any
+    tv-narrate-solo --run <run_dir> --fix      # rewrite narration.json, then rebuild
+
+The fix is to chain the offending cue to the previous one (`"at": null`), which
+makes the builder start it 0.35 s after the previous line ends. Chaining is
+applied transitively: once any cue in a segment is chained, every later cue in
+that SAME segment is chained too. Without that rule a later cue keeps its own
+early offset and simply collides with the end of the chain instead.
+
+A cross-segment bleed (the last line of segment N still talking when segment
+N+1's line starts) cannot be fixed by chaining — `at: null` only chains inside
+one segment. Shorten the overrunning line, drop it if the title card already
+says it, or give the next segment's first cue a later positive `at`.
+
+Run this after EVERY build, and rebuild until it reports zero.
+"""
+import argparse
+import collections
+import json
+import os
+import sys
+
+
+def load(run):
+    tl = os.path.join(run, "narration", "timeline.json")
+    sc = os.path.join(run, "narration.json")
+    if not os.path.exists(tl):
+        sys.exit(f"no timeline at {tl} — run `tv-narrate build` first")
+    return json.load(open(tl))["cues"], json.load(open(sc)), sc
+
+
+def overlaps(cues, tol=0.1):
+    out = []
+    for a, b in zip(cues, cues[1:]):
+        if b["start"] < a["end"] - tol:
+            out.append((a, b, round(b["start"] - a["end"], 2)))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--fix", action="store_true")
+    ap.add_argument("--tol", type=float, default=0.1)
+    a = ap.parse_args()
+
+    cues, script, script_path = load(a.run)
+    bad = overlaps(cues, a.tol)
+
+    gaps = [round(y["start"] - x["end"], 2) for x, y in zip(cues, cues[1:])]
+    print(f"{len(cues)} cues · {len(bad)} overlapping pairs · "
+          f"min gap {min(gaps) if gaps else 0}s")
+
+    if not bad:
+        print("OK — only one voice speaks at a time.")
+        return 0
+
+    same, cross = [], []
+    for x, y, g in bad:
+        (same if x["seg"] == y["seg"] else cross).append((x, y, g))
+
+    for x, y, g in bad:
+        kind = "same-segment" if x["seg"] == y["seg"] else "CROSS-SEGMENT"
+        print(f"\n  {kind}: seg{x['seg']} ends {x['end']:.2f} -> "
+              f"seg{y['seg']} starts {y['start']:.2f} ({g:+.2f}s)")
+        print(f"     A: {x['text'][:78]}")
+        print(f"     B: {y['text'][:78]}")
+
+    if not a.fix:
+        print("\nre-run with --fix to chain the same-segment ones")
+        return 1
+
+    if len(script["cues"]) != len(cues):
+        sys.exit("narration.json and timeline.json disagree on cue count — "
+                 "rebuild before fixing")
+
+    # chain every same-segment offender...
+    chained = 0
+    for i in range(1, len(cues)):
+        x, y = cues[i - 1], cues[i]
+        if y["seg"] == x["seg"] and y["start"] < x["end"] - a.tol:
+            if script["cues"][i]["at"] is not None:
+                script["cues"][i]["at"] = None
+                chained += 1
+
+    # ...then transitively chain the rest of each affected segment
+    by_seg = collections.defaultdict(list)
+    for i, c in enumerate(script["cues"]):
+        by_seg[c["seg"]].append(i)
+    for idxs in by_seg.values():
+        seen = False
+        for i in idxs:
+            if script["cues"][i]["at"] is None:
+                seen = True
+            elif seen:
+                script["cues"][i]["at"] = None
+                chained += 1
+
+    json.dump(script, open(script_path, "w"), indent=1)
+    print(f"\nchained {chained} cues in {script_path}")
+    if cross:
+        print(f"{len(cross)} CROSS-SEGMENT bleed(s) left — chaining cannot fix "
+              "those. Shorten the overrunning line, or push the next segment's "
+              "first cue later with a positive `at`.")
+    print("now: tv-narrate build … && tv-narrate-solo --run <run>")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

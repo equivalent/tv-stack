@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""tv-narrate — attach a spoken narration track to a QA screen recording.
+
+Subcommands:
+  bootstrap  create the TTS venv (edge-tts) if missing
+  plan       synthesise the cues and print the timing plan (no video work)
+  build      synthesise, pad segments to fit the speech, assemble the narrated mp4
+  frames     extract one frame per cue at the moment it is spoken (for verification)
+
+Input is a narration script (JSON) plus either a tv-record-video run folder
+(segments + segs.txt) or a single mp4.
+"""
+import argparse, hashlib, json, math, os, shlex, subprocess, sys, tempfile
+
+HOME = os.path.expanduser("~")
+VENV = os.path.join(HOME, ".local", "share", "tv-narrate", "venv")
+EDGE = os.path.join(VENV, "bin", "edge-tts")
+DEF_VOICE = "en-GB-RyanNeural"
+DEF_RATE = "+30%"   # 1.3x speed
+TAIL = 0.6          # silence kept after the last word of a segment
+LEADIN = 0.25       # default delay before the first cue of a segment
+NORM = ("scale=1920:1080:force_original_aspect_ratio=decrease,"
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,fps=30,format=yuv420p")
+
+
+def die(msg):
+    print(f"tv-narrate: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, **kw):
+    p = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if p.returncode != 0:
+        die(f"command failed: {shlex.join(cmd)}\n{p.stderr[-3000:]}")
+    return p.stdout
+
+
+def ffprobe_dur(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", path], capture_output=True, text=True).stdout.strip()
+    try:
+        return float(out)
+    except ValueError:
+        die(f"could not read duration of {path}")
+
+
+# ---------------------------------------------------------------- bootstrap
+def bootstrap(quiet=False):
+    if not os.path.exists(EDGE):
+        os.makedirs(os.path.dirname(VENV), exist_ok=True)
+        print("tv-narrate: creating TTS venv (one-off, ~20s)...", file=sys.stderr)
+        run([sys.executable, "-m", "venv", VENV])
+        run([os.path.join(VENV, "bin", "pip"), "install", "-q", "edge-tts"])
+    if not quiet:
+        v = subprocess.run([EDGE, "--version"], capture_output=True, text=True).stdout.strip()
+        print(f"tv-narrate: edge-tts ready ({v}) at {EDGE}")
+    return EDGE
+
+
+# ---------------------------------------------------------------- narration script
+def load_script(path):
+    with open(path) as f:
+        doc = json.load(f)
+    doc.setdefault("voice", DEF_VOICE)
+    doc.setdefault("rate", DEF_RATE)
+    doc.setdefault("music", "auto")     # auto | off | <path>
+    doc.setdefault("music_gain", 0.18)
+    cues = doc.get("cues")
+    if not cues:
+        die("narration script has no 'cues'")
+    for i, c in enumerate(cues):
+        if "text" not in c:
+            die(f"cue {i} has no 'text'")
+        c.setdefault("seg", 1)
+        c.setdefault("at", None)        # None = auto (LEADIN, or after previous cue)
+        c["_i"] = i
+    return doc
+
+
+def segments_for(args):
+    """Return [(path, duration)] for the run's video segments."""
+    if args.video:
+        return [(os.path.abspath(args.video), ffprobe_dur(args.video))]
+    listing = os.path.join(args.run, "segs.txt")
+    if not os.path.exists(listing):
+        die(f"no segs.txt in {args.run} (is this a tv-record-video run folder?)")
+    segs = []
+    with open(listing) as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("file '"):
+                continue
+            p = line[len("file '"):-1]
+            segs.append((p, ffprobe_dur(p)))
+    if not segs:
+        die("segs.txt is empty")
+    return segs
+
+
+# ---------------------------------------------------------------- tts
+def synth(doc, outdir):
+    """Synthesise every cue. Fills c['_mp3'], c['_dur'], c['_sentences']."""
+    bootstrap(quiet=True)
+    os.makedirs(outdir, exist_ok=True)
+    for c in doc["cues"]:
+        voice = c.get("voice", doc["voice"])
+        rate = c.get("rate", doc["rate"])
+        key = hashlib.sha1(f"{voice}|{rate}|{c['text']}".encode()).hexdigest()[:16]
+        mp3 = os.path.join(outdir, f"cue_{key}.mp3")
+        vtt = os.path.join(outdir, f"cue_{key}.vtt")
+        if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
+            last = ""
+            for attempt in range(3):
+                p = subprocess.run(
+                    [EDGE, "--voice", voice, f"--rate={rate}", "--text", c["text"],
+                     "--write-media", mp3, "--write-subtitles", vtt],
+                    capture_output=True, text=True)
+                if p.returncode == 0 and os.path.exists(mp3) and os.path.getsize(mp3) > 0:
+                    break
+                last = p.stderr
+            else:
+                die(f"edge-tts failed for cue {c['_i']}: {last[-800:]}")
+        c["_mp3"] = mp3
+        c["_dur"] = ffprobe_dur(mp3)
+        c["_sentences"] = parse_vtt(vtt)
+    return doc
+
+
+def parse_vtt(path):
+    """[(start, end, text)] per sentence, from edge-tts subtitles."""
+    if not os.path.exists(path):
+        return []
+    def ts(s):
+        s = s.strip().replace(",", ".")
+        h, m, rest = s.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+    out, cur = [], None
+    for line in open(path):
+        line = line.rstrip("\n")
+        if "-->" in line:
+            a, b = line.split("-->")
+            cur = [ts(a), ts(b), ""]
+        elif line.strip() == "":
+            if cur and cur[2]:
+                out.append(tuple(cur))
+            cur = None
+        elif cur is not None:
+            cur[2] = (cur[2] + " " + line.strip()).strip()
+    if cur and cur[2]:
+        out.append(tuple(cur))
+    return out
+
+
+# ---------------------------------------------------------------- timing
+def lay_out(doc, segs):
+    """Work out per-segment padding and absolute cue times.
+
+    A cue's 'at' is an offset in seconds from the start of its segment's
+    ORIGINAL footage. Negative means "start speaking before the segment's
+    action begins" — the segment's first frame is frozen for that long.
+    'at': null means "right after the previous cue in this segment".
+    """
+    by_seg = {}
+    for c in doc["cues"]:
+        if not (1 <= c["seg"] <= len(segs)):
+            die(f"cue {c['_i']} targets segment {c['seg']}, run has {len(segs)}")
+        by_seg.setdefault(c["seg"], []).append(c)
+
+    plan = []
+    for idx, (path, dur) in enumerate(segs, start=1):
+        cues = by_seg.get(idx, [])
+        cursor = LEADIN
+        for c in cues:
+            if c["at"] is None:
+                c["_at"] = cursor
+            else:
+                c["_at"] = float(c["at"])
+            cursor = c["_at"] + c["_dur"] + 0.35   # small beat between cues
+        start_pad = max(0.0, -min([c["_at"] for c in cues], default=0.0))
+        need = max([c["_at"] + start_pad + c["_dur"] for c in cues], default=0.0) + (TAIL if cues else 0.0)
+        end_pad = max(0.0, need - (dur + start_pad))
+        plan.append({"i": idx, "path": path, "src_dur": dur,
+                     "start_pad": round(start_pad, 3), "end_pad": round(end_pad, 3),
+                     "cues": cues})
+    return plan
+
+
+def print_plan(plan, doc):
+    total_src = sum(p["src_dur"] for p in plan)
+    total_new = sum(p["src_dur"] + p["start_pad"] + p["end_pad"] for p in plan)
+    print(f"voice {doc['voice']}  rate {doc['rate']}")
+    print(f"{'seg':>4} {'video':>7} {'+pre':>6} {'+post':>6} {'final':>7}  narration")
+    for p in plan:
+        fin = p["src_dur"] + p["start_pad"] + p["end_pad"]
+        first = True
+        if not p["cues"]:
+            print(f"{p['i']:>4} {p['src_dur']:>7.2f} {'':>6} {'':>6} {fin:>7.2f}  -")
+        for c in p["cues"]:
+            head = (f"{p['i']:>4} {p['src_dur']:>7.2f} {p['start_pad']:>6.2f} "
+                    f"{p['end_pad']:>6.2f} {fin:>7.2f}") if first else " " * 34
+            print(f"{head}  @{c['_at'] + p['start_pad']:>6.2f} {c['_dur']:>5.2f}s  "
+                  f"{c['text'][:74]}")
+            first = False
+    print(f"\ntotal: {total_src:.1f}s footage -> {total_new:.1f}s narrated "
+          f"(+{total_new - total_src:.1f}s of held frames)")
+    over = [p for p in plan if p["end_pad"] > 6.0]
+    if over:
+        print(f"WARNING: segments {[p['i'] for p in over]} need >6s of frozen frame — "
+              f"the narration there is much longer than the footage. Shorten the text "
+              f"or record a longer flow.", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- build
+def build_segment_video(p, workdir):
+    out = os.path.join(workdir, f"v{p['i']:03d}.mp4")
+    vf = NORM
+    if p["start_pad"] > 0.001:
+        vf += f",tpad=start_mode=clone:start_duration={p['start_pad']:.3f}"
+    if p["end_pad"] > 0.001:
+        vf += f",tpad=stop_mode=clone:stop_duration={p['end_pad']:.3f}"
+    run(["ffmpeg", "-nostdin", "-y", "-i", p["path"], "-vf", vf,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+         "-r", "30", "-an", out])
+    return out, ffprobe_dur(out)
+
+
+def build_segment_audio(p, dur, workdir):
+    out = os.path.join(workdir, f"a{p['i']:03d}.wav")
+    cmd = ["ffmpeg", "-nostdin", "-y",
+           "-f", "lavfi", "-t", f"{dur:.3f}",
+           "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+    parts, labels = [], ["[0:a]"]
+    for n, c in enumerate(p["cues"], start=1):
+        cmd += ["-i", c["_mp3"]]
+        ms = int(round((c["_at"] + p["start_pad"]) * 1000))
+        parts.append(f"[{n}:a]aresample=48000,aformat=channel_layouts=stereo,"
+                     f"adelay={ms}|{ms}[c{n}]")
+        labels.append(f"[c{n}]")
+    if parts:
+        fg = ";".join(parts) + ";" + "".join(labels) + \
+             f"amix=inputs={len(labels)}:duration=first:normalize=0[out]"
+        cmd += ["-filter_complex", fg, "-map", "[out]"]
+    cmd += ["-t", f"{dur:.3f}", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", out]
+    run(cmd)
+    return out
+
+
+def concat(files, out, workdir, tag, copy_args):
+    lst = os.path.join(workdir, f"{tag}.txt")
+    with open(lst, "w") as f:
+        for p in files:
+            f.write(f"file '{p}'\n")
+    run(["ffmpeg", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", lst] +
+        copy_args + [out])
+    return out
+
+
+def build(args):
+    doc = load_script(args.script)
+    segs = segments_for(args)
+    if args.run:
+        args.run = os.path.abspath(args.run).rstrip("/")
+    base = args.run or os.path.dirname(os.path.abspath(args.video))
+    workdir = os.path.join(base, "narration")
+    os.makedirs(workdir, exist_ok=True)
+    synth(doc, workdir)
+    plan = lay_out(doc, segs)
+    print_plan(plan, doc)
+    if args.dry_run:
+        return
+
+    vids, auds, timeline, t0 = [], [], [], 0.0
+    for p in plan:
+        v, vdur = build_segment_video(p, workdir)
+        a = build_segment_audio(p, vdur, workdir)
+        vids.append(v); auds.append(a)
+        for c in p["cues"]:
+            start = t0 + c["_at"] + p["start_pad"]
+            timeline.append({
+                "cue": c["_i"], "seg": p["i"], "start": round(start, 2),
+                "end": round(start + c["_dur"], 2), "text": c["text"],
+                "sentences": [{"start": round(start + s, 2), "end": round(start + e, 2),
+                               "text": t} for s, e, t in c["_sentences"]],
+            })
+        t0 += vdur
+
+    vcat = concat(vids, os.path.join(workdir, "video.mp4"), workdir, "vlist", ["-c", "copy"])
+    acat = concat(auds, os.path.join(workdir, "voice.wav"), workdir, "alist",
+                  ["-c:a", "pcm_s16le"])
+
+    out = args.out or ((args.run.rstrip("/") + "__narrated.mp4") if args.run
+                       else os.path.splitext(os.path.abspath(args.video))[0] + "__narrated.mp4")
+    music = pick_music(doc, args)
+    total = ffprobe_dur(vcat)
+    if music:
+        # music sits under the voice and ducks out of its way (sidechain compressor)
+        fg = (f"[2:a]volume={doc['music_gain']}[m];"
+              f"[m][1:a]sidechaincompress=threshold=0.02:ratio=12:attack=15:release=350[md];"
+              f"[md][1:a]amix=inputs=2:duration=first:normalize=0[a]")
+        run(["ffmpeg", "-nostdin", "-y", "-i", vcat, "-i", acat,
+             "-stream_loop", "-1", "-i", music, "-filter_complex", fg,
+             "-map", "0:v:0", "-map", "[a]", "-c:v", "copy", "-c:a", "aac",
+             "-b:a", "160k", "-t", f"{total:.3f}", out])
+    else:
+        run(["ffmpeg", "-nostdin", "-y", "-i", vcat, "-i", acat,
+             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+             "-b:a", "160k", "-t", f"{total:.3f}", out])
+
+    tl = {"video": out, "duration": round(ffprobe_dur(out), 2),
+          "voice": doc["voice"], "rate": doc["rate"],
+          "music": music or None, "cues": timeline}
+    tlp = os.path.join(workdir, "timeline.json")
+    with open(tlp, "w") as f:
+        json.dump(tl, f, indent=2)
+    print(f"\nnarrated video: {out}  ({tl['duration']:.1f}s)")
+    print(f"timeline:       {tlp}")
+
+
+def pick_music(doc, args):
+    m = doc.get("music", "auto")
+    if args.no_music or m == "off":
+        return None
+    if m == "auto":
+        cand = os.path.join(HOME, "music.mp3")
+        return cand if os.path.exists(cand) else None
+    return m if os.path.exists(m) else None
+
+
+# ---------------------------------------------------------------- segments
+def segments_cmd(args):
+    """List the run's segments with their durations and any recorded beats."""
+    segs = segments_for(args)
+    beats = {}
+    bp = os.path.join(args.run, "beats.tsv") if args.run else None
+    if bp and os.path.exists(bp):
+        for line in open(bp):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 3:
+                beats.setdefault(int(parts[0]), []).append((int(parts[1]) / 1000.0, parts[2]))
+    total = 0.0
+    for i, (path, dur) in enumerate(segs, start=1):
+        wh = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=width,height", "-of", "csv=s=x:p=0", path],
+            capture_output=True, text=True).stdout.strip()
+        print(f"{i:>3}  {dur:>6.2f}s  {wh:>9}  {os.path.basename(path)}"
+              f"   [{total:.1f}s -> {total + dur:.1f}s in the run]")
+        for t, label in beats.get(i, []):
+            print(f"          @{t:>6.2f}s  {label}")
+        total += dur
+    print(f"\n{len(segs)} segments, {total:.1f}s of footage")
+    if not beats:
+        print("no beats.tsv - sample frames to work out cue offsets:\n"
+              "  ffmpeg -nostdin -v error -y -ss <sec> -i <segment> -frames:v 1 "
+              "-vf scale=960:-2 /tmp/f.png")
+
+
+# ---------------------------------------------------------------- frames
+def frames(args):
+    with open(args.timeline) as f:
+        tl = json.load(f)
+    outdir = args.outdir or os.path.join(os.path.dirname(args.timeline), "verify")
+    os.makedirs(outdir, exist_ok=True)
+    manifest = []
+    for c in tl["cues"]:
+        # sample each SENTENCE at its midpoint: that is the instant the viewer
+        # hears those words, so the frame must show what the words claim.
+        spans = c["sentences"] or [{"start": c["start"], "end": c["end"], "text": c["text"]}]
+        for j, s in enumerate(spans):
+            mid = (s["start"] + s["end"]) / 2.0
+            png = os.path.join(outdir, f"c{c['cue']:03d}_{j}.png")
+            run(["ffmpeg", "-nostdin", "-y", "-ss", f"{mid:.2f}", "-i", tl["video"],
+                 "-frames:v", "1", "-vf", "scale=960:-2", "-q:v", "3", png])
+            manifest.append({"frame": png, "t": round(mid, 2), "seg": c["seg"],
+                             "spoken": s["text"]})
+    mp = os.path.join(outdir, "frames.json")
+    with open(mp, "w") as f:
+        json.dump({"video": tl["video"], "duration": tl["duration"],
+                   "frames": manifest}, f, indent=2)
+    print(mp)
+    for m in manifest:
+        print(f"{m['t']:>7.2f}s  {os.path.basename(m['frame']):<14} {m['spoken']}")
+
+
+# ---------------------------------------------------------------- cli
+def main():
+    ap = argparse.ArgumentParser(prog="tv-narrate")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("bootstrap")
+
+    for name in ("plan", "build"):
+        p = sub.add_parser(name)
+        p.add_argument("--script", required=True, help="narration JSON")
+        p.add_argument("--run", help="tv-record-video run folder (uses segs.txt)")
+        p.add_argument("--video", help="single mp4 instead of a run folder")
+        p.add_argument("--out", help="output mp4 (default <run>__narrated.mp4)")
+        p.add_argument("--no-music", action="store_true")
+        p.set_defaults(dry_run=(name == "plan"))
+
+    g = sub.add_parser("segments")
+    g.add_argument("--run", help="tv-record-video run folder")
+    g.add_argument("--video", help="single mp4 instead of a run folder")
+
+    f = sub.add_parser("frames")
+    f.add_argument("--timeline", required=True)
+    f.add_argument("--outdir")
+
+    a = ap.parse_args()
+    if a.cmd == "bootstrap":
+        bootstrap()
+    elif a.cmd in ("plan", "build"):
+        if not a.run and not a.video:
+            die("give --run <folder> or --video <file>")
+        build(a)
+    elif a.cmd == "segments":
+        if not a.run and not a.video:
+            die("give --run <folder> or --video <file>")
+        if a.run:
+            a.run = os.path.abspath(a.run).rstrip("/")
+        segments_cmd(a)
+    elif a.cmd == "frames":
+        frames(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Put a short "## QA video" section at the bottom of a PR description. It holds no
+# video: it says the QA run video is in the QA comment below and links to that comment.
+#
+#   tv-qa-pr-link <pr-number> <section.md>
+#
+# section.md is the Markdown that goes under the "## QA video" heading. It must link
+# to the comment that holds the video (a URL with #issuecomment-); that URL is what
+# `tv-qa-doc-comment video` prints.
+#
+# - Replaces an earlier tv-qa section (between the tv-qa markers), so a re-run
+#   never adds a second one. That also removes the video player older runs put there.
+# - Puts the section above cubic's auto-generated block when there is one,
+#   otherwise at the very end.
+set -euo pipefail
+
+pr="${1:?pr number}"; section="${2:?section markdown file}"
+grep -q '#issuecomment-' "$section" || { echo "section.md must link to the QA comment (#issuecomment-…)" >&2; exit 1; }
+
+old="$(mktemp)"; new="$(mktemp)"
+gh pr view "$pr" --json body --jq .body > "$old"
+
+python3 - "$old" "$section" "$new" <<'PY'
+import re, sys
+old, section, out = (open(sys.argv[1]).read(), open(sys.argv[2]).read().strip(), sys.argv[3])
+start, end = "<!-- tv-qa:start -->", "<!-- tv-qa:end -->"
+body = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n*", "", old, flags=re.S).rstrip()
+block = f"{start}\n## QA video\n\n{section}\n{end}\n"
+cubic = "<!-- This is an auto-generated description by cubic. -->"
+if cubic in body:
+    head, tail = body.split(cubic, 1)
+    body = f"{head.rstrip()}\n\n{block}\n{cubic}{tail}\n"
+else:
+    body = f"{body}\n\n{block}"
+open(out, "w").write(body)
+PY
+
+gh pr edit "$pr" --body-file "$new" >/dev/null
+rm -f "$old" "$new"
+
+got="$(gh pr view "$pr" --json body --jq .body | sed -n '/<!-- tv-qa:start -->/,/<!-- tv-qa:end -->/p')"
+if grep -q '#issuecomment-' <<<"$got"; then
+  echo "ok: the QA video section of PR #$pr links to the QA comment"
+else
+  echo "FAILED: the QA video section has no link to the QA comment. Section now reads:" >&2
+  echo "$got" >&2
+  exit 1
+fi

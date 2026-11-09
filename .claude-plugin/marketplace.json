@@ -1,0 +1,9 @@
+{
+  "name": "tv-stack",
+  "owner": { "name": "Tomas Valent" },
+  "metadata": { "description": "Tomas Valent's Claude Code plugins: QA videos with narration, and QA docs and runs." },
+  "plugins": [
+    { "name": "tv-video", "source": "./plugins/tv-video", "description": "Record browser QA flows as video and narrate them." },
+    { "name": "tv-qa", "source": "./plugins/tv-qa", "description": "Gherkin QA docs, recorded QA runs and run reports for a pull request." }
+  ]
+}

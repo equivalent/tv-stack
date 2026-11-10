@@ -29,7 +29,7 @@
       return p + (keys.length ? "?" + keys.join("&") : "");
     } catch { return null; }
   };
-  // Rails nesting collapses: invoice[amount], invoice[due_on] -> invoice[amount, due_on]
+  // Rails nesting collapses: order[amount], order[due_on] -> order[amount, due_on]
   const names = keys => {
     const groups = new Map();
     for (const k of keys) {

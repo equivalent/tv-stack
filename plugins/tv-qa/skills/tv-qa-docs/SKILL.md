@@ -137,7 +137,7 @@ Follow `template.md`. The file has, in order:
 1. `# QA test plan: <feature>` and a link to the PR or issue.
 2. **In short** (`## In short`): two or three very short paragraphs a person can listen to
    through text-to-speech. Say what gets tested and where, in plain prose: "This tests the
-   open invoice count in the customer drawer, and the new status checkboxes in the invoice
+   open order count in the customer drawer, and the new status checkboxes in the order
    filters." No bullets, no code, no backticks, no paths, no URLs, no symbols such as arrows or
    slashes, no numbers a voice reads badly. The rest of the doc holds the details. This section
    is what shows on the PR without a click.
@@ -158,7 +158,7 @@ Gherkin rules:
 - Steps name what the user **sees**: the field's real label in quotes, the button text, the exact
   message. Not CSS classes or element IDs. "The field is outlined in red" is fine.
 - `Then` steps check **the end result** (saved record, message shown, status code, printed
-  invoice), not a click.
+  receipt), not a click.
 - Each scenario stands alone: it sets up its own data (`Given … exists`) and doesn't depend on
   an earlier scenario.
 - Plain words. Keep the exact values, limits and messages in the steps.

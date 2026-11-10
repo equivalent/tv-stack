@@ -140,7 +140,7 @@ person.
 **Cover, across the video as a whole:**
 
 1. **An opening line** — what feature or change is under test, and on what.
-   ("This is a QA pass over the new invoice summary boxes on the invoice list.")
+   ("This is a QA pass over the new order summary boxes on the order list.")
 2. **Per section** — what this numbered scenario checks and why it matters.
 3. **Per action** — what is being done, in the moment. ("Filling in a customer
    email that is already registered.")
@@ -156,7 +156,7 @@ what makes a viewer able to judge the test rather than just watch a cursor move.
 is no way to rewind a video comfortably):
 
 - No code, no file paths, no identifiers read literally, no URLs, no symbols
-  that don't read aloud. Say "the invoice list page", not a slash-separated path.
+  that don't read aloud. Say "the order list page", not a slash-separated path.
 - Short sentences. Plain prose, no lists, no headings.
 - Numbers spoken naturally: "section one point two", not "1.2".
 - Present tense for what is happening, and say the *user-visible* thing, not the
@@ -242,7 +242,7 @@ Full list: `~/.local/share/tv-narrate/venv/bin/edge-tts --list-voices`.
 2. **Learn what each segment actually contains** — never narrate from memory:
 
    ```bash
-   RUN=~/qaRun/2026-09-10_11-20__invoice_filters
+   RUN=~/qaRun/2026-09-10_11-20__order_filters
    $NARR segments --run "$RUN"
    ```
 
@@ -343,7 +343,7 @@ structurally incapable of seeing.
 ```bash
 $NARR  frames --timeline "$RUN/narration/timeline.json"
 $NARRV --frames "$RUN/narration/verify/frames.json" \
-       --context "Feature under test: invoice list summary boxes and filters."
+       --context "Feature under test: order list summary boxes and filters."
 ```
 
 `frames` extracts **one frame per spoken sentence, at the midpoint of that
@@ -392,10 +392,10 @@ a whole class of false positives off the table before it starts.
   gets reported as populated, so "the box is empty, which proves it was never
   stored" comes back `MISMATCH`. Don't re-time it — say *"the grey text in it is
   only a placeholder"* so a human viewer doesn't make the same mistake either.
-- **The issuer block read as the customer block.** A document with the sender's
+- **The sender block read as the recipient block.** A document with the sender's
   details at the bottom and the recipient's at the top gets conflated. Name the
-  region in the line: *"in the Invoiced to block there is one line"*.
-- **A tax column read as a tax-number line.** "No VAT line" on an invoice that
+  region in the line: *"in the Ship to block there is one line"*.
+- **A tax column read as a tax-number line.** "No VAT line" on a receipt that
   plainly shows a VAT charge column is genuinely ambiguous. Say which thing you
   mean.
 

@@ -176,7 +176,7 @@ pass, 1 fails"). No video line: the script adds the player. The run report stays
 on disk; step 7 gives the user its path.
 
 ```markdown
-QA pass of the invoice setup, recorded 2026-10-13: 7 of 8 scenarios pass, 1 fails.
+QA pass of the order checkout, recorded 2026-10-13: 7 of 8 scenarios pass, 1 fails.
 ```
 
 **b. Put the video into the comment.**
@@ -209,7 +209,7 @@ same sentence and tally, then one line that says the video is in the comment bel
 with the link from step b.
 
 ```markdown
-QA pass of the invoice setup, recorded 2026-10-13: 7 of 8 scenarios pass, 1 fails.
+QA pass of the order checkout, recorded 2026-10-13: 7 of 8 scenarios pass, 1 fails.
 
 The QA run video is in the QA comment below: [watch it here](https://github.com/…#issuecomment-…).
 ```

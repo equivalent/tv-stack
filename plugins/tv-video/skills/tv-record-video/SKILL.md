@@ -40,13 +40,13 @@ get the browser to the right place.
 - **Do not film sign-in** unless the QA is about sign-in. Sign in off camera
   (`keep_login`), before the first `goto`.
 - **Do not film the landing page after sign-in** (the dashboard, the home page)
-  unless the QA point needs it, for example "the new invoice shows on the
+  unless the QA point needs it, for example "the new order shows on the
   dashboard".
 - **Do not film the clicks through the menus** that lead to the feature. Open
   the nearest page to the feature directly with `goto`.
 - **Start each recording at the closest natural starting point** of the thing
-  under test. Testing invoice creation? `goto` the invoice list, then click
-  "New invoice" on camera. Do not start at the dashboard and click through the
+  under test. Testing order creation? `goto` the order list, then click
+  "New order" on camera. Do not start at the dashboard and click through the
   sidebar, and do not start already on the filled form either: the viewer
   should see the one click that starts the flow.
 - **Stop as soon as the result is clear.** Once the success message, the error,
@@ -106,10 +106,10 @@ bottom-right corner with the last 5 requests the page made, newest at the
 bottom, so the viewer sees which request each click or debounced input caused:
 
 ```
-GET    /invoices/new  200 85ms
+GET    /orders/new  200 85ms
 POST   /reactive/actions  recalculate  amount, currency  200 83ms
-POST   /invoices  invoice[customer_name, amount, currency, +2]  302 83ms
-PATCH  /invoices/42/send_email  422 82ms
+POST   /orders  order[customer_name, amount, currency, +2]  302 83ms
+PATCH  /orders/42/send_email  422 82ms
 ```
 
 - It is `bin/qa_request_log.js`. Outside a recording it is an agent-browser
@@ -125,7 +125,7 @@ PATCH  /invoices/42/send_email  422 82ms
   A path part longer than 24 characters (a token, a signed id) keeps its
   first 8 characters.
 - **Field names only, never values** — no customer data in the video. Rails
-  nesting is grouped (`invoice[a, b, +2]`), the CSRF token and `_method` are
+  nesting is grouped (`order[a, b, +2]`), the CSRF token and `_method` are
   hidden (a `_method=patch` row shows `PATCH`), a phlex-reactive row shows the
   action name instead of the signed token, a query string shows its keys only.
 - Status is green for 2xx, amber for 3xx, red for 4xx/5xx. Rows dim after 4 s,

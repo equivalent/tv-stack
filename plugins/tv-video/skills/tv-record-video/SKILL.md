@@ -606,15 +606,19 @@ keep_login() {
 }
 _keep_login_if_set() { [ -z "$(_get APP_ORIGIN)" ] || keep_login; }
 
+# Milliseconds since the epoch. GNU date knows %3N; macOS date prints a literal
+# "3N", so fall back to perl, which macOS ships.
+_ms() { local t; t="$(date +%s%3N)"; case "$t" in *N) perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000' ;; *) echo "$t" ;; esac; }
+
 # Segment plumbing. A segment = one continuous recording between `open` jumps.
 _seg_stop()  { if [ "$(_get RECORDING)" = 1 ]; then _keep_login_if_set; ab record stop >/dev/null 2>&1; _keep_login_if_set; _set RECORDING 0; local c; c="$(_get CURSEG)"; [ -s "$c" ] && printf "file '%s'\n" "$c" >> "$SEGS"; fi; }
-_seg_start() { local n; n=$(( $(_get SEG_N 2>/dev/null || echo 0) + 1 )); _set SEG_N "$n"; local c; c="$(printf '%s/seg%03d.webm' "$RUN_DIR" "$n")"; _set CURSEG "$c"; _keep_login_if_set; ab record start "$c" >/dev/null 2>&1; _keep_login_if_set; _set RECORDING 1; _set SEG_T0 "$(date +%s%3N)"; }
+_seg_start() { local n; n=$(( $(_get SEG_N 2>/dev/null || echo 0) + 1 )); _set SEG_N "$n"; local c; c="$(printf '%s/seg%03d.webm' "$RUN_DIR" "$n")"; _set CURSEG "$c"; _keep_login_if_set; ab record start "$c" >/dev/null 2>&1; _keep_login_if_set; _set RECORDING 1; _set SEG_T0 "$(_ms)"; }
 
 # Log a narration anchor: which segment, how many ms into it, what just happened.
 # Written to beats.tsv and read later by `tv-narrate-video` to place spoken cues.
 # Call it after any step you would want a narrator to talk over. Wall-clock, so
 # accurate to roughly a third of a second - good enough to aim a sentence at.
-beat() { [ "$(_get RECORDING)" = 1 ] || return 0; printf '%d\t%d\t%s\n' "$(_get SEG_N)" "$(( $(date +%s%3N) - $(_get SEG_T0) ))" "$1" >> "$RUN_DIR/beats.tsv"; }
+beat() { [ "$(_get RECORDING)" = 1 ] || return 0; printf '%d\t%d\t%s\n' "$(_get SEG_N)" "$(( $(_ms) - $(_get SEG_T0) ))" "$1" >> "$RUN_DIR/beats.tsv"; }
 
 # Navigate to a URL as a NEW segment (closes the previous one), then re-apply the
 # badge. Use this for EVERY explicit URL jump once recording has started.

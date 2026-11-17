@@ -247,5 +247,5 @@ Tell the user, in this order:
   video-only comment
 - the QA doc comment URL, and whether it was posted, edited or already there
 - the paths of the narrated video and the run report on disk
-- anything not checked: NOT RUN scenarios, and whether the Codex narration review
-  ran or was skipped because there is no Codex CLI on this machine
+- anything not checked: NOT RUN scenarios, and whether the Sonnet narration review
+  ran, or why it could not run

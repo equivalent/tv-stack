@@ -19,8 +19,9 @@ Claude Code plugins by Tomas Valent.
 ## What the machine needs
 
 `agent-browser`, `ffmpeg`, `magick`, `gh` (signed in), and Python 3 for the
-edge-tts voice (`tv-narrate bootstrap` sets it up on first use). The `codex` CLI
-is optional: without it the narration check is skipped and the report says so.
+edge-tts voice (`tv-narrate bootstrap` sets it up on first use). The narration check
+runs Claude Sonnet through the `claude` CLI; without it the check is skipped and
+the report says so.
 
 ## Project notes
 

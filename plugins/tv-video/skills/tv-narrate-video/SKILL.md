@@ -1,6 +1,6 @@
 ---
 name: tv-narrate-video
-description: Use when the user says "narrate the video", "add narration", "add a voiceover", "add commentary to the video", "/tv-narrate-video", or asks for a QA recording to have a spoken audio track. Writes a spoken narration for a QA screen recording (normally one produced by tv-record-video), synthesises it with a neural TTS voice, and muxes it onto the video with the audio locked to the picture — holding frames where the speech needs longer. Then has Codex (gpt-5.6-sol) watch the result frame-by-frame and confirm the words match what is on screen, and iterates on that feedback. Goal: a human understands exactly what was tested without ever opening the QA document.
+description: Use when the user says "narrate the video", "add narration", "add a voiceover", "add commentary to the video", "/tv-narrate-video", or asks for a QA recording to have a spoken audio track. Writes a spoken narration for a QA screen recording (normally one produced by tv-record-video), synthesises it with a neural TTS voice, and muxes it onto the video with the audio locked to the picture — holding frames where the speech needs longer. Then has Claude Sonnet look at the result frame by frame and confirm the words match what is on screen, and iterates on that feedback. Goal: a human understands exactly what was tested without ever opening the QA document.
 ---
 
 # Narrate a QA video
@@ -26,7 +26,7 @@ For run folder `~/qaRun/<stamp>__<desc>/`:
 | `<run>/narration/` | synthesised cue mp3s, padded segments, working files |
 | `<run>/narration/timeline.json` | every cue and sentence with its absolute time in the final video |
 | `<run>__narrated.mp4` | **the deliverable** |
-| `<run>/narration/verify/` | frames + Codex verdicts from the check pass |
+| `<run>/narration/verify/` | frames + Sonnet verdicts from the check pass |
 
 The silent `<run>.mp4` from `tv-record-video` is left untouched.
 
@@ -262,7 +262,7 @@ Full list: `~/.local/share/tv-narrate/venv/bin/edge-tts --list-voices`.
    out seconds wrong and nearly every line lands early or late. `tv-defreeze`
    (in this plugin's `bin/`) rewrites `beats.tsv` through the same kept-interval
    map it used to trim; if the run was trimmed some other way, re-map them the
-   same way rather than guessing by eye. A whole round of Codex notes — 17 `EARLY`
+   same way rather than guessing by eye. A whole round of reviewer notes — 17 `EARLY`
    and 9 `LATE` — was this one cause.
 
    Beats are wall-clock, so trust them to about a third of a second. For anything
@@ -303,38 +303,31 @@ Full list: `~/.local/share/tv-narrate/venv/bin/edge-tts --list-voices`.
    segment needs, it does not tell you that two cues will be mixed on top of each
    other.
 
-7. **Verify with Codex** if the CLI exists on this machine (`command -v codex`)
-   — see next section — **once**. One review run, no second, no exceptions.
-   Each run costs about fifteen minutes and a lot of tokens. Apply its fixes,
-   build again, and ship. No Codex CLI means no review: skip it, ship, and say
-   so in the report.
+7. **Verify with Sonnet** — see next section — **once**. One review run, no
+   second, no exceptions. Apply its fixes, build again, and ship. If the
+   `claude` CLI is missing or the review fails, ship anyway and say so in the
+   report.
 
 8. **Report.** Give the user the narrated path, the duration, the
-   voice used, and the Codex verdict summary — or, if the CLI was not present,
-   say plainly that the narration was not independently verified on this machine.
+   voice used, and the Sonnet verdict summary — or, if the review could not run,
+   say plainly that the narration was not independently verified.
 
-## Verification with Codex (REQUIRED WHERE AVAILABLE — MAXIMUM 1 REVIEW RUN)
+## Verification with Sonnet (MAXIMUM 1 REVIEW RUN)
 
-**First, check the Codex CLI is actually on this machine:**
+Watching your own narration is not verification — you wrote it, so you already
+believe it. `tv-narrate-verify` runs the Claude Code CLI headless
+(`claude -p`) on **Sonnet at high effort**, with only the Read tool, from the
+frames folder so no project instructions load. It sends ten frames per call
+and reads the answer through a strict JSON schema. It used to call Codex; that
+cost too much of the Codex usage limit for a job Sonnet does well, so it does
+not any more.
 
-```bash
-command -v codex || echo "no codex CLI — skip the review"
-```
+Sonnet is enough here. The job is "read a screenshot and say whether this
+sentence fits it", which is plain image reading. Pass `--model opus` only when
+Sonnet keeps missing real problems on a run. It needs the `claude` CLI signed
+in (`command -v claude`); without it, skip the review, ship, and say so.
 
-It is not installed everywhere. If it is missing, **skip the review entirely and
-ship**. Do not try to install it, do not look for another reviewer, and do not
-stall waiting for one. Say so in the report — "no Codex CLI on this machine, so
-the narration was not independently verified" — and let the user decide whether
-that matters. The rest of the pipeline stands on its own: the one-voice check,
-the frame sampling you do yourself while writing, and the run report are all
-still there.
-
-Where it is available, use it. Watching your own narration is not verification —
-you wrote it, so you already believe it. `tv-narrate-verify` shells out to
-`codex exec` in read-only sandbox mode, on `gpt-5.6-sol` at medium reasoning,
-feeding it frames from the finished mp4 and a strict output schema.
-
-**Run the one-voice check first.** Codex *looks*, it does not *listen* — it is
+**Run the one-voice check first.** The reviewer *looks*, it does not *listen* — it is
 sent still frames, never the audio. It will happily pass a video in which two
 voices are talking over each other. So `$NARRS --run "$RUN"` has to be clean
 before you spend a review cycle here, or you will ship a defect the reviewer was
@@ -348,7 +341,7 @@ $NARRV --frames "$RUN/narration/verify/frames.json" \
 
 `frames` extracts **one frame per spoken sentence, at the midpoint of that
 sentence** — literally what the viewer is looking at while hearing those words.
-`tv-narrate-verify` sends them to `gpt-5.6-sol` at **medium** reasoning, ten
+`tv-narrate-verify` sends them to Sonnet at **high** effort, ten
 frames per request, with a strict output schema, and returns per-frame verdicts:
 
 | Verdict | Meaning | What you do |
@@ -366,8 +359,7 @@ the video promises a scenario it never shows, an outcome is never called a pass
 or a fail, or a screen changes with nobody saying why.
 
 **One review run is a hard ceiling, and the reason is cost.** Each run sends
-every frame of the video to Codex in batches and takes about fifteen minutes and
-a large number of tokens. A second run buys a handful of extra `MATCH` verdicts on
+every frame of the video to Sonnet in batches and costs a real number of tokens. A second run buys a handful of extra `MATCH` verdicts on
 a video that is already good, and chasing the last few is how a QA pass quietly
 turns into an afternoon. One run, then ship.
 
@@ -377,9 +369,9 @@ correct to `narration.json`, `build` once more if you changed anything, run the
 one-voice check again, and ship. Do not run a second `tv-narrate-verify` pass,
 no matter how many `MISMATCH`/`EARLY`/`LATE` verdicts remain — one round is the
 budget, not a suggestion. Report to the user which notes you did not act on and
-why, instead of asking Codex again.
+why, instead of asking the reviewer again.
 
-Codex is a reviewer, not an oracle. If it flags a title-card line as `EARLY`
+Sonnet is a reviewer, not an oracle. If it flags a title-card line as `EARLY`
 because the line introduces what is about to happen, that is correct by design —
 push back rather than mangling the narration to satisfy it. You are the arbiter.
 Tell it so in `--context`: *"title cards deliberately introduce what is about to
@@ -436,8 +428,9 @@ changing — if the reviewer can misread the frame, so can the viewer.
 
 ## Gotchas (each of these was hit and fixed here)
 
-- `codex exec`'s `-i/--image` is variadic and **swallows a trailing positional
-  prompt**. The prompt must go over **stdin**. `tv-narrate-verify` does this.
+- `tv-narrate-verify` gives Sonnet absolute frame paths and `--add-dir` for
+  their folder; without `--add-dir` the Read tool refuses files outside the
+  working folder. The prompt goes over **stdin**.
 - Never mux with `-shortest` when a looping music bed is present — it truncates
   the tail of the video. The scripts pass an explicit `-t`.
 - Concatenating mixed-resolution segments directly stretches the smaller ones;

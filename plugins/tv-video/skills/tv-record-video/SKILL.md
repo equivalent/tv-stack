@@ -475,8 +475,8 @@ A silent video makes the viewer guess what they are looking at. When the user
 wants the recording to explain itself — "narrate it", "add a voiceover", "add
 commentary" — hand the finished run folder to the **`tv-narrate-video`** skill.
 It writes the script, synthesises a neural voice, locks each line to the segment
-it describes (holding frames where the speech needs longer), and then has Codex
-watch the result and confirm the words match the picture.
+it describes (holding frames where the speech needs longer), and then has Claude Sonnet
+look at the result and confirm the words match the picture.
 
 Two things this recording pass owes it:
 

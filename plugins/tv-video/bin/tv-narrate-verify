@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""tv-narrate-verify — ask Codex (gpt-5.6-sol) whether the narration matches the picture.
+"""tv-narrate-verify — ask Claude Sonnet whether the narration matches the picture.
 
-Feeds Codex one frame per spoken sentence, sampled at the instant that sentence
+Runs the Claude Code CLI headless (`claude -p`, Sonnet, high effort, Read tool
+only) and gives it one frame per spoken sentence, sampled at the instant that sentence
 is heard, together with the sentence itself, and asks for a per-frame verdict.
 Frames are sent in batches so no single request carries too many images.
 """
@@ -56,7 +57,7 @@ read the QA document would understand what is being tested.
 
 You are given {n} frames. Each frame was captured at the exact midpoint of one
 spoken sentence, so the frame is what the viewer is looking at while hearing
-that sentence. The frames are attached in the same order as this list:
+that sentence. Open every frame with the Read tool (absolute paths below), in this order:
 
 {listing}
 
@@ -86,9 +87,9 @@ Finally judge "understandable_without_qa_doc": could a colleague who has never
 seen the QA document watch this and know what feature is under test, what each
 scenario checks, and whether it passed? List what is still missing.
 
-Answer with JSON matching the provided schema and nothing else.
-Do not read or modify any files; everything you need is in this prompt and the
-attached images."""
+Answer with JSON matching the provided schema and nothing else. In "frame",
+give the file name only, not the path. Read only the frame files listed above;
+do not read or change any other file."""
 
 
 def batches(items, n):
@@ -99,9 +100,9 @@ def batches(items, n):
 def main():
     ap = argparse.ArgumentParser(prog="tv-narrate-verify")
     ap.add_argument("--frames", required=True, help="frames.json from `tv-narrate frames`")
-    ap.add_argument("--batch", type=int, default=10, help="frames per codex call")
-    ap.add_argument("--model", default="gpt-5.6-sol")
-    ap.add_argument("--effort", default="medium")
+    ap.add_argument("--batch", type=int, default=10, help="frames per claude call")
+    ap.add_argument("--model", default="sonnet")
+    ap.add_argument("--effort", default="high")
     ap.add_argument("--context", default="", help="extra context, e.g. the feature under test")
     ap.add_argument("--out", help="where to write the merged verdict JSON")
     a = ap.parse_args()
@@ -117,33 +118,33 @@ def main():
     merged = {"verdicts": [], "overall": [], "understandable_without_qa_doc": []}
     for bi, (start, chunk) in enumerate(batches(frames, a.batch), start=1):
         listing = "\n".join(
-            f"  {i+1}. {os.path.basename(fr['frame'])}  at {fr['t']}s  "
+            f"  {i+1}. {os.path.abspath(fr['frame'])}  at {fr['t']}s  "
             f"spoken: \"{fr['spoken']}\"" for i, fr in enumerate(chunk))
         extra = f"\n\nContext for this run: {a.context}" if a.context else ""
         prompt = PROMPT.format(n=len(chunk), listing=listing,
                                duration=doc["duration"], extra=extra)
-        last = os.path.join(outdir, f"codex_batch{bi}.json")
-        cmd = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-               "-m", a.model, "-c", f'model_reasoning_effort="{a.effort}"',
-               "--output-schema", schema_path, "-o", last]
-        for fr in chunk:
-            cmd += ["-i", fr["frame"]]
-        # The prompt goes over stdin, NOT as a trailing argument: `-i/--image` is
-        # variadic and swallows any positional that follows it.
-        print(f"tv-narrate-verify: batch {bi} ({len(chunk)} frames) -> codex {a.model}/{a.effort}",
+        last = os.path.join(outdir, f"claude_batch{bi}.json")
+        cmd = ["claude", "-p", "--model", a.model, "--effort", a.effort,
+               "--tools", "Read", "--allowedTools", "Read",
+               "--strict-mcp-config", "--no-session-persistence",
+               "--output-format", "json", "--json-schema", json.dumps(SCHEMA)]
+        for d in sorted({os.path.dirname(os.path.abspath(fr["frame"])) for fr in chunk}):
+            cmd += ["--add-dir", d]
+        print(f"tv-narrate-verify: batch {bi} ({len(chunk)} frames) -> claude {a.model}/{a.effort}",
               file=sys.stderr)
-        p = subprocess.run(cmd, input=prompt, capture_output=True, text=True)
-        if p.returncode != 0 or not os.path.exists(last):
+        # Run from the frames folder so no project instructions get loaded.
+        p = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=outdir)
+        with open(last, "w") as f:
+            f.write(p.stdout)
+        try:
+            out = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            out = {}
+        res = out.get("structured_output")
+        if p.returncode != 0 or out.get("is_error") or not isinstance(res, dict):
             print(p.stdout[-2000:], file=sys.stderr)
             print(p.stderr[-2000:], file=sys.stderr)
-            sys.exit(f"codex failed on batch {bi}")
-        with open(last) as f:
-            raw = f.read().strip()
-        try:
-            res = json.loads(raw)
-        except json.JSONDecodeError:
-            s, e = raw.find("{"), raw.rfind("}")
-            res = json.loads(raw[s:e + 1])
+            sys.exit(f"claude failed on batch {bi}")
         merged["verdicts"] += res.get("verdicts", [])
         merged["overall"].append(res.get("overall", ""))
         merged["understandable_without_qa_doc"].append(

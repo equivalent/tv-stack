@@ -196,8 +196,9 @@ only when the user asks for a second comment. The comment shows the `## In short
 then the whole doc folded in `<details>`. It starts with the hidden marker
 `<!-- tv-qa-doc -->`, which is how the next run finds it.
 
-After a `/tv-qa` run the same comment also holds the QA run video, in a `## QA video`
-block below the folded doc. `post` keeps that block when it edits the comment.
+The QA run results (summary, video, run report) are not in this comment: each `/tv-qa`
+run posts them as its own new comment. `post` removes an old `## QA video` block that
+earlier runs put into this comment.
 
 The script refuses a doc that looks like it holds a password, and a comment over about
 65,000 characters. For a doc that big, make it shorter (merge repeated steps into

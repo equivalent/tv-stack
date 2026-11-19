@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Post the result of a QA run as a NEW comment on a pull request, then hide the older ones.
+#
+#   tv-qa-run-comment <pr> <summary.md> <report.md> [video.mp4]
+#
+# The comment starts with the marker <!-- tv-qa-run -->, then "## QA run", then
+# summary.md (short, for people), then the video player when a video is given, then
+# report.md folded in <details> (the run report, written for agents).
+#
+# Every run posts a new comment, also a run with no video. After the new comment is
+# posted and read back, the script:
+#   - hides each older QA run comment of the signed-in user as Outdated (GitHub's Hide),
+#     and each older video-only comment (from the time the video lived in the QA comment);
+#   - removes an old "## QA video" block from the QA doc comment (<!-- tv-qa-doc -->);
+#   - removes an old "## QA video" section from the PR description. The description
+#     is no longer updated by QA runs.
+# It never deletes a comment of the user and never edits a comment's text, except the
+# QA doc comment's old video block.
+#
+# gh can attach a file only through `gh pr comment --attach`, and it does not put a
+# video where the body references it. So the video goes up through a short temporary
+# comment, the script copies the user-attachments URL into the new comment's body, and
+# deletes the temporary comment. GitHub keeps the asset when its comment is deleted.
+#
+# Prints the URL of the new comment. Run it inside the repo, or set GH_REPO=owner/repo.
+set -euo pipefail
+
+pr="${1:?pr number}"; summary="${2:?summary.md}"; report="${3:?report.md}"; video="${4:-}"
+[ -f "$summary" ] || { echo "no such file: $summary" >&2; exit 1; }
+[ -f "$report" ] || { echo "no such file: $report" >&2; exit 1; }
+repo="${GH_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
+me="$(gh api user --jq .login)"
+
+if grep -niE 'password[^s]*[:=]' "$summary" "$report"; then
+  echo "the summary or report looks like it holds a password; fix it before posting" >&2; exit 1
+fi
+
+json_body() {
+  python3 -c 'import json,sys; json.dump({"body": open(sys.argv[1]).read()}, open(sys.argv[2], "w"))' "$1" "$2"
+}
+
+# 1. Upload the video, when there is one.
+asset=""
+if [ -n "$video" ]; then
+  [ -f "$video" ] || { echo "no such video: $video" >&2; exit 1; }
+  video="$(cd "$(dirname "$video")" && pwd)/$(basename "$video")"
+  name="$(basename "$video")"; dir="$(dirname "$video")"
+  tag="tv-qa-upload-$(date +%s)-$$"
+  tmp_body="$dir/.$tag.md"
+  printf '<!-- %s -->\nUploading the QA video. This comment is removed in a moment.\n\n![QA video](./%s)\n' "$tag" "$name" > "$tmp_body"
+  size_mb=$(( $(stat -c %s "$video" 2>/dev/null || stat -f %z "$video") / 1048576 ))
+  echo "uploading $name (${size_mb} MB) to PR #$pr" >&2
+  ( cd "$dir" && gh pr comment "$pr" -R "$repo" --body-file "$(basename "$tmp_body")" --attach "./$name" ) >/dev/null
+  rm -f "$tmp_body"
+  tmp="$(gh api "repos/$repo/issues/$pr/comments" --paginate \
+    --jq ".[] | select(.user.login == \"$me\") | select(.body | contains(\"<!-- $tag -->\")) | [.id, .body] | @json" | head -n 1)"
+  [ -n "$tmp" ] || { echo "FAILED: the upload comment did not appear" >&2; exit 1; }
+  tmp_id="$(jq -r '.[0]' <<<"$tmp")"
+  asset="$(jq -r '.[1]' <<<"$tmp" | grep -oE 'https://github\.com/user-attachments/assets/[A-Za-z0-9-]+' | head -n 1 || true)"
+  gh api -X DELETE "repos/$repo/issues/comments/$tmp_id" >/dev/null
+  if [ -z "$asset" ]; then
+    echo "FAILED: gh did not upload the video (too big? GitHub takes 10 MB on free plans, 100 MB on paid)" >&2
+    exit 1
+  fi
+fi
+
+# 2. Build and post the new comment.
+body="$(mktemp)"; payload="$(mktemp)"
+python3 - "$summary" "$report" "$asset" "$body" <<'PY'
+import sys
+summary = open(sys.argv[1]).read().strip()
+report = open(sys.argv[2]).read().strip()
+asset, out = sys.argv[3], sys.argv[4]
+parts = ["<!-- tv-qa-run -->", "## QA run", "", summary, ""]
+if asset:
+    parts += [asset, ""]
+parts += ["<details>", "<summary>QA run report (for agents)</summary>", "", report, "", "</details>", ""]
+open(out, "w").write("\n".join(parts))
+PY
+size=$(wc -c < "$body")
+if [ "$size" -gt 65000 ]; then
+  echo "comment would be $size characters; GitHub takes about 65,000. Shorten the report's passed section and run again." >&2
+  rm -f "$body" "$payload"; exit 1
+fi
+json_body "$body" "$payload"
+read -r new_id url < <(gh api -X POST "repos/$repo/issues/$pr/comments" --input "$payload" --jq '"\(.id) \(.html_url)"') || true
+[ -n "${new_id:-}" ] || { echo "FAILED: could not post the QA run comment" >&2; exit 1; }
+rm -f "$body" "$payload"
+
+# 3. Read it back.
+got="$(gh api "repos/$repo/issues/comments/$new_id" --jq .body)"
+head -n 1 <<<"$got" | grep -q '^<!-- tv-qa-run -->' || { echo "FAILED: the new comment does not start with the marker" >&2; exit 1; }
+if [ -n "$asset" ]; then
+  grep -qF "$asset" <<<"$got" || { echo "FAILED: the new comment has no video link" >&2; exit 1; }
+  code="$(curl -s -o /dev/null -w '%{http_code}' -I -H "Authorization: token $(gh auth token)" "$asset" || true)"
+  case "$code" in
+    200|302) ;;
+    *) echo "WARNING: the video URL answers HTTP $code: $asset" >&2 ;;
+  esac
+fi
+echo "posted the QA run comment" >&2
+
+# 4. Hide older QA run comments and older video-only comments as Outdated.
+old_ids="$(gh api "repos/$repo/issues/$pr/comments" --paginate --jq "
+  .[] | select(.user.login == \"$me\") | select(.id != $new_id)
+      | select((.body | startswith(\"<!-- tv-qa-run -->\"))
+               or ((.body | contains(\"<!-- tv-qa-video:start -->\")) and (.body | startswith(\"<!-- tv-qa-doc -->\") | not)))
+      | \"\(.id) \(.node_id)\"")"
+while read -r id node; do
+  [ -n "$id" ] || continue
+  state="$(gh api graphql -f query='mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized minimizedReason}}}' \
+    -f id="$node" --jq '.data.minimizeComment.minimizedComment | "\(.isMinimized) \(.minimizedReason)"')"
+  case "$state" in
+    "true "[Oo][Uu][Tt][Dd][Aa][Tt][Ee][Dd]) echo "hid older comment $id as outdated" >&2 ;;
+    *) echo "WARNING: could not hide comment $id (answer: $state)" >&2 ;;
+  esac
+done <<<"$old_ids"
+
+# 5. Remove the old video block from the QA doc comment.
+doc_ids="$(gh api "repos/$repo/issues/$pr/comments" --paginate --jq "
+  .[] | select(.user.login == \"$me\") | select(.body | startswith(\"<!-- tv-qa-doc -->\"))
+      | select(.body | contains(\"<!-- tv-qa-video:start -->\")) | .id")"
+for id in $doc_ids; do
+  body="$(mktemp)"; payload="$(mktemp)"
+  gh api "repos/$repo/issues/comments/$id" --jq .body | python3 -c '
+import re, sys
+old = sys.stdin.read().replace("\r\n", "\n")
+sys.stdout.write(re.sub(r"\n*<!-- tv-qa-video:start -->.*?<!-- tv-qa-video:end -->\n*", "\n", old, flags=re.S).rstrip() + "\n")' > "$body"
+  json_body "$body" "$payload"
+  gh api -X PATCH "repos/$repo/issues/comments/$id" --input "$payload" >/dev/null
+  rm -f "$body" "$payload"
+  echo "removed the old video block from the QA doc comment $id" >&2
+done
+
+# 6. Remove the old QA video section from the PR description.
+old="$(mktemp)"
+gh pr view "$pr" -R "$repo" --json body --jq .body > "$old"
+if grep -q '<!-- tv-qa:start -->' "$old"; then
+  new="$(mktemp)"
+  python3 - "$old" "$new" <<'PY'
+import re, sys
+body = open(sys.argv[1]).read()
+body = re.sub(r"\n*<!-- tv-qa:start -->.*?<!-- tv-qa:end -->\n*", "\n\n", body, flags=re.S).strip() + "\n"
+open(sys.argv[2], "w").write(body)
+PY
+  gh pr edit "$pr" -R "$repo" --body-file "$new" >/dev/null
+  rm -f "$new"
+  echo "removed the old QA video section from the PR description" >&2
+fi
+rm -f "$old"
+
+echo "$url"

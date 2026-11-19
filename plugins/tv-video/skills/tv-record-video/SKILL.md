@@ -261,6 +261,11 @@ previous session silently writes the first segments into an old run folder and
 mixes them into that run's `segs.txt`. Cache the *state* inside `$RUN_DIR`
 (`$RUN_DIR/.state`), and derive `$RUN_DIR` itself from `date` each time.
 
+**A caller may hand you the run folder.** `tv-qa-video` (from `/tv-qa`) passes the
+`$RUN_DIR` its QA run already made, with the run report beside it, and a list of
+the scenarios to film. Use that folder and film only those scenarios, keeping
+their QA doc numbers.
+
 ## Timing conventions
 
 | Frame type                        | On-screen duration                  |
@@ -452,8 +457,9 @@ nobody watches.
 10. **Write the QA run report (REQUIRED for QA runs).** If this recording was a QA
    pass — i.e. it followed a QA document/checklist or exercised numbered
    scenarios — you **must** then invoke the `tv-qa-run-report` skill to write a
-   companion HTML report. Reuse this run's exact base name so the report sits
-   beside the video: `$RUN_DIR.mp4` → `${RUN_DIR}__report.html`. Pass it the
+   companion Markdown report. Reuse this run's exact base name so the report sits
+   beside the video: `$RUN_DIR.mp4` → `${RUN_DIR}__report.md`. (Under `/tv-qa`
+   the report is already written before the recording; skip this step.) Pass it the
    scenarios you ran, the data used, and the observed outcome for each, so the
    report records what was tested and how it turned out. (Skip only for a
    freeform, non-QA "just record this flow" video.)
@@ -466,7 +472,7 @@ nobody watches.
 
 Recording the video is half the deliverable; the other half is the written
 record. For any QA run, pair the video with a **`tv-qa-run-report`** document
-(`~/qaRun/<same-base-name>__report.html`) summarising what was tested, how, with
+(`~/qaRun/<same-base-name>__report.md`) summarising what was tested, how, with
 what data, and the outcome. Invoke that skill as the final step (see step 10).
 
 ## Companion skill — spoken narration
@@ -822,7 +828,7 @@ When finished, tell the user:
 - the total video duration (`ffprobe -v error -show_entries format=duration
   "$RUN_DIR.mp4"`),
 - the video path (`$RUN_DIR.mp4`),
-- the QA run report path (`${RUN_DIR}__report.html`) — for a QA run you must have
+- the QA run report path (`${RUN_DIR}__report.md`) — for a QA run you must have
   generated it via `tv-qa-run-report` (workflow step 10); report both paths.
 
 ## Tips

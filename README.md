@@ -5,7 +5,7 @@ Claude Code plugins by Tomas Valent.
 | Plugin | Skills | What it does |
 |---|---|---|
 | `tv-video` | `tv-record-video`, `tv-narrate-video` | Records browser QA flows as a real screen video with section cards and a corner badge, then adds a spoken narration that stays in step with the picture. |
-| `tv-qa` | `tv-qa-docs`, `tv-qa`, `tv-qa-run-report` | Writes a Gherkin QA doc for a pull request and keeps it in one PR comment, runs it in the browser on a narrated video, and writes a QA run report. Needs `tv-video`. |
+| `tv-qa` | `tv-qa-docs`, `tv-qa`, `tv-qa-run-report`, `tv-qa-video` | Writes a Gherkin QA doc for a pull request and keeps it in one PR comment, runs it in the browser, writes a run report for agents, records a narrated video of the failed and unsure scenarios (all of them on request), and posts each run as a new PR comment, hiding the older ones as outdated. Needs `tv-video`. |
 
 ## Install
 
